@@ -1,29 +1,61 @@
-# Introduction to Admission controllers
+
+# Introduction to Kubernetes Admission controllers
 
 [Admission Webhook](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/#what-are-admission-webhooks)
 
 <hr/>
 
-## Installation (local)
-<hr/>
-
-Create a kind cluster:
-
-```
-kind create cluster --name webhook --image kindest/node:v1.20.2
-```
-
-## TLS certificate notes for Webhook
-
+## Create TLS certificate to webhook
 <hr/>
 
 In order for our webhook to be invoked by Kubernetes, we need a TLS certificate.<br/>
 In this demo I'll be using a self signed cert. <br/>
 It's ok for development, but for production I would recommend using a real certificate instead. <br/>
 
-We'll use a very handy CloudFlare SSL tool in a docker container to get this done. <br/>
+## TLS certificate for Webhook
 
-Follow [Use CFSSL to generate certificates](./tls/ssl_generate_self_signed.md)
+We'll use a very handy CloudFlare SSL tool in a docker container to get this done.
+
+```
+docker run -it --rm -v ${PWD}:/work -w /work debian bash
+
+apt-get update && apt-get install -y curl &&
+curl -L https://github.com/cloudflare/cfssl/releases/download/v1.5.0/cfssl_1.5.0_linux_amd64 -o /usr/local/bin/cfssl && \
+curl -L https://github.com/cloudflare/cfssl/releases/download/v1.5.0/cfssljson_1.5.0_linux_amd64 -o /usr/local/bin/cfssljson && \
+chmod +x /usr/local/bin/cfssl && \
+chmod +x /usr/local/bin/cfssljson
+
+#generate ca in /tmp
+cfssl gencert -initca ./tls/ca-csr.json | cfssljson -bare /tmp/ca
+
+#generate certificate in /tmp
+cfssl gencert \
+  -ca=/tmp/ca.pem \
+  -ca-key=/tmp/ca-key.pem \
+  -config=./tls/ca-config.json \
+  -hostname="example-webhook,example-webhook.default.svc.cluster.local,example-webhook.default.svc,localhost,127.0.0.1" \
+  -profile=default \
+  ./tls/ca-csr.json | cfssljson -bare /tmp/example-webhook
+
+#make a secret
+cat <<EOF > ./tls/example-webhook-tls.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: example-webhook-tls
+type: Opaque
+data:
+  tls.crt: $(cat /tmp/example-webhook.pem | base64 | tr -d '\n')
+  tls.key: $(cat /tmp/example-webhook-key.pem | base64 | tr -d '\n') 
+EOF
+
+#generate CA Bundle + inject into template
+ca_pem_b64="$(openssl base64 -A <"/tmp/ca.pem")"
+
+sed -e 's@${CA_PEM_B64}@'"$ca_pem_b64"'@g' <"webhook-template.yaml" \
+    > webhook.yaml
+```
+
 
 After the above, we should have: <br/>
 * a Webhook YAML file
@@ -31,127 +63,120 @@ After the above, we should have: <br/>
 * a TLS certificate (Kubernetes secret)
 <br/>
 
-## Local Development
+## Create API for webhook
+The code on Golang language is native of the Kubernetes and use the same library that development of Kubernetes and the cli kubectl.
 
-<hr/>
+The below code will represent the Mutating Webhook and ValidatingWebhook
 
-We always start with a `dockerfile` since we need a Go dev environment.
-
-```
-FROM golang:1.15-alpine as dev-env
-
-WORKDIR /app
-
-```
-
-Build and run the controller
-
-```
-# get dev environment: webhook
-
-cd sourcecode
-docker build . -t webhook
-docker run -it --rm -p 80:80 -v ${PWD}:/app webhook sh
-
-```
-
-We always start with Hello world! <br/>
-Let's define our basic main module and a web server
-
-```
-go mod init example-webhook
-```
-
-New file : `main.go`
-```
+### The first block have the package name and import the library necessary for build
+````
 package main
 
 import (
-  "net/http"
 	"log"
+	"net/http"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"k8s.io/client-go/kubernetes"
+	rest "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
+
+	"flag"
+	"io/ioutil"
+	"strconv"
+
+	"errors"
+
+	"k8s.io/api/admission/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"encoding/json"
+
+	apiv1 "k8s.io/api/core/v1"
+
+	"bytes"
+
+	"github.com/sirupsen/logrus"
+	"github.com/slackhq/simple-kubernetes-webhook/pkg/admission"
+	admissionv1 "k8s.io/api/admission/v1"
 )
-
-func main() {
-  http.HandleFunc("/", HandleRoot)
-	http.HandleFunc("/mutate", HandleMutate)
-  log.Fatal(http.ListenAndServe(":80", nil))
-}
-
-func HandleRoot(w http.ResponseWriter, r *http.Request){
-	w.Write([]byte("HandleRoot!"))
-}
-
-func HandleMutate(w http.ResponseWriter, r *http.Request){
-	w.Write([]byte("HandleMutate!"))
-}
-
 ```
 
-Build our code and run it
+### The second block define the variables, constants and structu that we will use
+````
 
-```
-export CGO_ENABLED=0
-go build -o webhook
-./webhook
-```
-
-We'll be able to hit the `http://localhost/mutate` endpoint in the browser <br/>
-
-NOTE: In Windows, container networking is not fully supported. Our container exposes port 80, but to access our Kubernetes cluster which runs in another container, we need to enable `--net host` flag. This means exposing port 80 will stop working from here on <br/>
-
-Let's exit the container and start with `--net host` so our container can access our kubernetes `kind` cluster 
-
-```
-docker run -it --rm --net host -v ${HOME}/.kube/:/root/.kube/ -v ${PWD}:/app webhook sh
-```
-
-We can also test our access to our kubernetes cluster with the config that is mounted in:
-
-```
-apk add --no-cache curl
-curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/linux/amd64/kubectl
-chmod +x ./kubectl
-mv ./kubectl /usr/local/bin/kubectl
-```
-
-# Kubernetes 
-
-How do we interact with Kubernetes ? </br>
-Kubernetes provides many libraries and we'll interact with some of these today
-
-Since we'll receive webhook events from Kubernetes, we'll need to translate these
-requests into objects or structs that we understand.
-
-For this, the serializer is important:
-
-```
-"k8s.io/apimachinery/pkg/runtime"
-"k8s.io/apimachinery/pkg/runtime/serializer"
 
 var (
-	universalDeserializer = serializer.NewCodecFactory(runtime.NewScheme()).UniversalDeserializer()
+	tlscert, tlskey string
+    universalDeserializer = serializer.NewCodecFactory(runtime.NewScheme()).UniversalDeserializer()
+    config *rest.Config
+    clientSet *kubernetes.Clientset
+    parameters ServerParameters
 )
 
+
+type ServerParameters struct {
+	port     int    // webhook server port
+	certFile string // path to the x509 certificate for https
+	keyFile  string // path to the x509 private key matching `CertFile`
+}
+
+type patchOperation struct {
+	Op    string      `json:"op"`
+	Path  string      `json:"path"`
+	Value interface{} `json:"value,omitempty"`
+}
+
+// Namespace struct for parsing
+type Namespace struct {
+	Metadata Metadata `json:"metadata"`
+}
+
+// Metadata struct for parsing
+type Metadata struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+}
+
+const (
+	// InvalidMessage will be return to the user.
+	InvalidMessage = "namespace missing required team label"
+	requiredLabel  = "team"
+	port           = ":8444"
+)
+
+
+
 ```
 
-To access Kubernetes, we need to define a config and a client using our config. <br/>
-We can authenticate with K8s in a number of ways. <br/>
-
-First way is good for local development and thats using a kubeconfig file. <br/>
-For production, we'll use a Kubernetes service account with RBAC permissions. <br/>
-We'll do both methods today. <br/>
+### Third block function main
+The steps of the function main
+- Load the certificates
+- Validate if connect in Kubernetes by kueconfig or library in cluter
+- Start the webserver
 
 ```
-# define our config and client
-var config *rest.Config
-var clientSet *kubernetes.Clientset
+func main() {
 
-# in main()
+	//	go another()
+	useKubeConfig := os.Getenv("USE_KUBECONFIG")
+	kubeConfigFilePath := os.Getenv("KUBECONFIG")
 
-useKubeConfig := os.Getenv("USE_KUBECONFIG")
-kubeConfigFilePath := os.Getenv("KUBECONFIG")
+	flag.IntVar(&parameters.port, "port", 8443, "Webhook server port.")
+	flag.StringVar(&parameters.certFile, "tlsCertFile", "/etc/webhook/certs/tls.crt", "File containing the x509 Certificate for HTTPS.")
+	flag.StringVar(&parameters.keyFile, "tlsKeyFile", "/etc/webhook/certs/tls.key", "File containing the x509 private key to --tlsCertFile.")
+	// flag.StringVar(&parameters.certFile, "tlsCertFile", "/tmp/tls/tls.crt", "File containing the x509 Certificate for HTTPS.")
+	// flag.StringVar(&parameters.keyFile, "tlsKeyFile", "/tmp/tls/tls.key", "File containing the x509 private key to --tlsCertFile.")
+	flag.Parse()
 
-if len(useKubeConfig) == 0 {
+	if len(useKubeConfig) == 0 {
 		// default to service account in cluster token
 		c, err := rest.InClusterConfig()
 		if err != nil {
@@ -165,12 +190,12 @@ if len(useKubeConfig) == 0 {
 		if kubeConfigFilePath == "" {
 			if home := homedir.HomeDir(); home != "" {
 				kubeconfig = filepath.Join(home, ".kube", "config")
-			} 
+			}
 		} else {
 			kubeconfig = kubeConfigFilePath
 		}
 
-    fmt.Println("kubeconfig: " + kubeconfig)
+		fmt.Println("kubeconfig: " + kubeconfig)
 
 		c, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
@@ -179,227 +204,34 @@ if len(useKubeConfig) == 0 {
 		config = c
 	}
 
-```
-
-Once we built our kubeconfig, we can instantiate a client to use in our app: 
-
-```
 	cs, err := kubernetes.NewForConfig(config)
-  if err != nil {
-    panic(err.Error())
-  }
-  clientSet = cs
-```
+	if err != nil {
+		panic(err.Error())
+	}
+	clientSet = cs
 
-And we'll need to import the dependencies for this:
-
-```
-	"os"
-	"fmt"
-	"path/filepath"
-	"k8s.io/client-go/kubernetes"
-	rest "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/homedir"
-```
-
-Since we're also using the client-go library, we need to install the same version as 
-the other libraries as we can see in the `go.mod` file, we're using `v0.21.0`
-
-```
-go get k8s.io/client-go@v0.21.0
-```
-
-Rebuild to ensure no errors:
-
-```
-go build -o webhook
-```
-
-Test with a kubeconfig
-
-```
-export USE_KUBECONFIG=true
-./webhook
-```
-
-To test our access, let's create a `test.go` and return pods from the kube-system namespace
-
-```
-#test.go
-package main 
-
-import ()
-
-func test(){
+	http.HandleFunc("/", HandleRoot)
+	http.HandleFunc("/mutate", HandleMutate)
+	http.HandleFunc("/validate", HandleValidate)
+	http.HandleFunc("/validate-pods", HandleValidatePods)
+	log.Fatal(http.ListenAndServeTLS(":"+strconv.Itoa(parameters.port), parameters.certFile, parameters.keyFile, nil))
 }
 ```
 
-Use our global clientset defined in main() and get all pods 
+### four block of the mutate
+The mutate recive the json of object and verify the fields baeing able change the fields or block the request. After the treat the object return the request with changed.
+In this exemple we are incluing the lable **mylable: it-worked** 
 
 ```
-	pods, err := clientSet.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
+func HandleMutate(w http.ResponseWriter, r *http.Request) {
 
+	body, err := ioutil.ReadAll(r.Body)
+	err = ioutil.WriteFile("/tmp/request", body, 0644)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	fmt.Printf("There are %d pods in the cluster\n", len(pods.Items))
-
-```
-
-Define dependencies:
-
-```
-	"context"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"fmt"
-```
-
-And finally invoking it in main() calling `test()` <br/>
-
-Run and test our Kubernetes access:
-
-```
-bash-5.0# ./webhook
-kubeconfig: /root/.kube/config
-There are 11 pods in the cluster
-```
-
-## Mutating Webhook
-
-Now that we have a working app that can talk to Kubernetes, lets implement our webhook endpoint and deploy it to kubernetes to see what type of message the API server sends us when events happen
-
-Firstly, we need to enable a TLS endpoint </br>
-Let's take some parameters where we can set the path to the TLS certificate and port number to run on. </br>
-
-Import flag dependency:
-
-```
-"flag"
-"strconv"
-```
-
-Define our parameters for cert configuration
-
-```
-type ServerParameters struct {
-	port           int    // webhook server port
-	certFile       string // path to the x509 certificate for https
-	keyFile        string // path to the x509 private key matching `CertFile`
-}
-
-var parameters ServerParameters
-
-# in main()
-
-  flag.IntVar(&parameters.port, "port", 8443, "Webhook server port.")
-  flag.StringVar(&parameters.certFile, "tlsCertFile", "/etc/webhook/certs/tls.crt", "File containing the x509 Certificate for HTTPS.")
-  flag.StringVar(&parameters.keyFile, "tlsKeyFile", "/etc/webhook/certs/tls.key", "File containing the x509 private key to --tlsCertFile.")
-  flag.Parse()
-
-# start our web server exposing TLS endpoint 
-
-	log.Fatal(http.ListenAndServeTLS(":" + strconv.Itoa(parameters.port), parameters.certFile, parameters.keyFile, nil))
-
-```
-
-Let's capture the request coming from Kubernetes and write it to local file for analysis
-
-```
-# dependencies
-"io/ioutil"
-
-# HandleMutate
-body, err := ioutil.ReadAll(r.Body)
-err = ioutil.WriteFile("/tmp/request", body, 0644)
-if err != nil {
-  panic(err.Error())
-}
-```
-
-## Deployment
-<hr/>
-
-Let's built what we have and deploy it to our kubernetes cluster
-We will firstly need to add a build step to our `dockerfile` to build the code </br>
-And we'll also need to create a smaller runtime layer in our `dockerfile`
-
-Full `dockerfile` :
-
-```
-FROM golang:1.15-alpine as dev-env
-
-WORKDIR /app
-
-FROM dev-env as build-env
-COPY go.mod /go.sum /app/
-RUN go mod download
-
-COPY . /app/
-
-RUN CGO_ENABLED=0 go build -o /webhook
-
-FROM alpine:3.10 as runtime
-
-COPY --from=build-env /webhook /usr/local/bin/webhook
-RUN chmod +x /usr/local/bin/webhook
-
-ENTRYPOINT ["webhook"]
-
-```
-
-Let's build the container and push it to a registry:
-
-```
-docker build . -t aimvector/example-webhook:v1
-docker push aimvector/example-webhook:v1
-```
-
-```
-
-# apply generated secret
-kubectl -n default apply -f ./tls/example-webhook-tls.yaml
-
-
-kubectl -n default apply -f rbac.yaml
-kubectl -n default apply -f deployment.yaml
-kubectl -n default get pods
-
-# ensure above pods are running first
-
-kubectl -n default apply -f webhook.yaml
-
-```
-
-# Deploy a demo that needs mutation
-
-```
-kubectl -n default  apply -f ./demo-pod.yaml
-```
-
-We should now be able to see an example request from Kubernetes sitting in our `tmp/request` location. This request is called an "AdmissionReview" <br/>
-
-Kubernetes sends us an `AdmissionReview` and expects an AdmissionResponse back. <br/>
-
-We can copy this review locally and use it for development so we dont need to deploy to 
-kubernetes constantly. For example:
-
-```
-kubectl cp example-webhook-756bcb566b-9kxjp:/tmp/request ./mock-request.json
-```
-
-So lets grab the info from the admission request, so we can do something with it
-
-
-```
-  //dependencies 
-  "k8s.io/api/admission/v1beta1"
-  "errors"
-
-  //HandleMutate()
-
-  var admissionReviewReq v1beta1.AdmissionReview
+	var admissionReviewReq v1beta1.AdmissionReview
 
 	if _, _, err := universalDeserializer.Decode(body, nil, &admissionReviewReq); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -415,114 +247,144 @@ So lets grab the info from the admission request, so we can do something with it
 		admissionReviewReq.Request.Name,
 	)
 
-```
+	var pod apiv1.Pod
 
-# Mutation
+	err = json.Unmarshal(admissionReviewReq.Request.Object.Raw, &pod)
 
-Firstly we need to grab the Pod object from the admission request
+	if err != nil {
+		fmt.Errorf("could not unmarshal pod on admission request: %v", err)
+	}
 
+	var patches []patchOperation
 
-```
-//dependencies 
-apiv1 "k8s.io/api/core/v1"
+	labels := pod.ObjectMeta.Labels
+	labels["mylabel"] = "it-worked"
 
-var pod apiv1.Pod
+	patches = append(patches, patchOperation{
+		Op:    "add",
+		Path:  "/metadata/labels",
+		Value: labels,
+	})
 
-err = json.Unmarshal(admissionReviewReq.Request.Object.Raw, &pod)
-
-if err != nil {
-  fmt.Errorf("could not unmarshal pod on admission request: %v", err)
-}
-
-```
-
-To perform a simple mutation on the object before the Kubernetes API sees the object, we can apply a patch to the operation.
-
-```
-//global
-
-type patchOperation struct {
-	Op    string      `json:"op"`
-	Path  string      `json:"path"`
-	Value interface{} `json:"value,omitempty"`
-}
-
-//HandleMutate()
-var patches []patchOperation
-```
-
-Add a label that we can inject on the pod
-We have to craft the kubernetes object we want to patch. <br/>
-For example, a label is part of the Metadata API on the Pod spec
-
-https://pkg.go.dev/k8s.io/api/core/v1#Pod
-
-```
-// Get existing Metadata labels
-
-labels := pod.ObjectMeta.Labels
-labels["example-webhook"] = "it-worked"
-
-patches = append(patches, patchOperation{
-				Op:    "add",
-				Path:  "/metadata/labels",
-				Value: labels,
-		})
-```
-
-Once you have completed all your patching, convert the patches to byte slice:
-
-```
 	patchBytes, err := json.Marshal(patches)
+
 	if err != nil {
 		fmt.Errorf("could not marshal JSON patch: %v", err)
 	}
+
+	admissionReviewResponse := v1beta1.AdmissionReview{
+		Response: &v1beta1.AdmissionResponse{
+			UID:     admissionReviewReq.Request.UID,
+			Allowed: true,
+		},
+	}
+
+	admissionReviewResponse.Response.Patch = patchBytes
+	admissionReviewResponse.Response.Result = &metav1.Status{
+		Message: InvalidMessage + " then pod name is: " + pod.ObjectMeta.Name + " not authorized to deploy",
+	}
+
+	bytes, err := json.Marshal(&admissionReviewResponse)
+	if err != nil {
+		fmt.Errorf("marshaling response: %v", err)
+	}
+
+	w.Write(bytes)
+
+}
 ```
 
-Add it to the admission response
+### Five block check if namespace has tha label team if haven`t the request is denied
 
 ```
-  admissionReviewResponse := v1beta1.AdmissionReview{
-      Response: &v1beta1.AdmissionResponse{
-        UID: admissionReviewReq.Request.UID,
-        Allowed: true,
-      },
-    }
+func HandleValidate(w http.ResponseWriter, r *http.Request) {
+	fmt.Printf("In function validate namespace\n")
+	arReview := v1beta1.AdmissionReview{}
+	if err := json.NewDecoder(r.Body).Decode(&arReview); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	} else if arReview.Request == nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
 
-  admissionReviewResponse.Response.Patch = patchBytes
+	raw := arReview.Request.Object.Raw
 
-  bytes, err := json.Marshal(&admissionReviewResponse)
-    if err != nil {
-      fmt.Errorf("marshaling response: %v", err)
-    }
-  
-  w.Write(bytes)
+	ns := Namespace{}
+	if err := json.Unmarshal(raw, &ns); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	} else if ns.Metadata.isEmpty() {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
 
-  //dependencies 
-  "encoding/json"
+	arReview.Response = &v1beta1.AdmissionResponse{
+		UID:     arReview.Request.UID,
+		Allowed: true,
+	}
+
+	if len(ns.Metadata.Labels) == 0 || ns.Metadata.Labels[requiredLabel] == "" {
+		arReview.Response.Allowed = false
+		arReview.Response.Result = &metav1.Status{
+			Message: InvalidMessage + " namespace name is: " + ns.Metadata.Name,
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&arReview)
+}
 ```
 
-# Build and push the updates
+### The examples is possible to improve your environment:
 
+1. Check if deploy has the specific label
 ```
-docker build . -t aimvector/example-webhook:v1
-docker push aimvector/example-webhook:v1
-```
-
-# Delete all pods to get latest image
-
-```
-kubectl delete pods --all
+namespaceSelector:
+    matchExpressions:
+    - key: environment
+        operator: In
+        values: ["prod","staging"]
 ```
 
-# Redeploy our demo pod and see the mutations
+2. Inject the sidecar equal the ISTIo
+``` 
+  namespaceSelector:
+    matchExpressions:
+    - key: istio-injection
+      operator: DoesNotExist
+    - key: istio.io/rev
+      operator: DoesNotExist
+  objectSelector:
+    matchExpressions:
+    - key: sidecar.istio.io/inject
+      operator: In
+      values:
+      - "true"
+    - key: istio.io/rev
+      operator: DoesNotExist
+```
 
+3. If the cotainer content the privileged
 ```
-kubectl -n default  apply -f ./demo-pod.yaml
-```
+ match:
+    scope: Namespaced
+    kinds:
+    - apiGroups: ["*"]
+      kinds: ["Pod"]
+    excludedNamespaces: ["system"]
+  location: "spec.containers[name:*].securityContext.privileged"
+````
 
-See the injected label
+4. If the deployment content the resources limits or requests
+```
+ match:
+    scope: Namespaced
+    kinds:
+    - apiGroups: ["*"]
+      kinds: ["Pod"]
+    excludedNamespaces: ["system"]
+  location: "spec.containers[*].resources"
+````
 
-```
-kubectl get pods --show-labels
-```
+ 
